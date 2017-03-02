@@ -10,57 +10,91 @@ from datetime import datetime
 from oauthlib.oauth2 import LegacyApplicationClient
 from requests_oauthlib import OAuth2Session
 
+from auth0.v2 import authentication as auth0
+import requests
+import jwt
+from calendar import timegm
+from datetime import datetime
+
+# default to GBDX production auth0 client ID
+GBDX_AUTH0_CLIENT_ID = os.environ.get('GBDX_AUTH0_CLIENT_ID', "vhaNEJymL4m1UCo4TqXmuKtkn9JCYDkT")
+GBDX_AUTH0_DOMAIN = os.environ.get('GBDX_AUTH0_DOMAIN', "digitalglobe-platform.auth0.com")
+
+if not GBDX_AUTH0_CLIENT_ID:
+    raise Exception("GBDX_AUTH0_CLIENT_ID must be defined. Value provided was '{}'".format(GBDX_AUTH0_CLIENT_ID) )
+
+if not GBDX_AUTH0_DOMAIN:
+    raise Exception("GBDX_AUTH0_DOMAIN must be defined. Value provided was '{}'".format(GBDX_AUTH0_DOMAIN) )
+
+def setup_gbdx_request_session(access_token, refresh_token):
+
+    if not access_token:
+        raise Exception("access_token is a required parameter. Value provided was '{}'".format(access_token) )
+
+    if not refresh_token:
+        raise Exception("refresh_token is a required parameter. Value provided was '{}'".format(refresh_token) )
+
+    s = requests.Session()
+    headers = {"Authorization":"Bearer {}".format(access_token)}
+    s.headers.update(headers)
+
+    return s
+
+def auth0_get_token_from_resource_owner_credentials(username=None, password=None):
+    if not username:
+        raise Exception('username is required')
+
+    if not password:
+        raise Exception('password is required')
+
+    d = auth0.Database(domain=GBDX_AUTH0_DOMAIN)
+    return d.login(client_id=GBDX_AUTH0_CLIENT_ID, username=username, password=password, connection='Username-Password-Authentication', device='scope=offline_access', scope='openid offline_access')
+
+
+def auth0_get_token_from_refresh_token(refresh_token=None):
+    if not refresh_token:
+        raise Exception('refresh_token is required')
+
+    d = auth0.Delegated(domain=GBDX_AUTH0_DOMAIN)
+    return d.get_token(client_id=GBDX_AUTH0_CLIENT_ID, target=GBDX_AUTH0_CLIENT_ID, grant_type='urn:ietf:params:oauth:grant-type:jwt-bearer', refresh_token=refresh_token, scope='openid offline_access', api_type='app')
+
+def auth0_is_access_token_expired(access_token):
+    try:
+        #
+        # Check if the token is expired and try to refresh it.
+        # NOTE signature is not validated here. We do not have access to the client_secret and
+        #   are only concerned about expired tokens. Server side apis will validate the signature.
+        #
+        jwt.decode(access_token, audience=GBDX_AUTH0_CLIENT_ID, options={"verify_signature":False})
+    except jwt.ExpiredSignatureError:
+        # automatically refresh any tokens that expire in the future
+        token = auth0_get_token_from_refresh_token(refresh_token)
+        access_token = token['id_token']
+
+
 def session_from_envvars(auth_url='https://geobigdata.io/auth/v1/oauth/token/',
                          environ_template=(('username', 'GBDX_USERNAME'),
-                                           ('password', 'GBDX_PASSWORD'),
-                                           ('client_id', 'GBDX_CLIENT_ID'),
-                                           ('client_secret', 'GBDX_CLIENT_SECRET'))):
+                                           ('password', 'GBDX_PASSWORD'))):
     """Returns a session with the GBDX authorization token baked in,
     pulling the credentials from environment variables.
 
-    environ_template - An iterable of key, value pairs. The key should
-                      be the variables used in the oauth workflow, and
-                      the values being the environment variables to
-                      pull the configuration from.  Change the
-                      template values if your envvars differ from the
-                      default, but make sure the keys remain the same.
-
-    NOTE: There are two ways to create a GBDX session from environment variables.
-    Set an env variable GBDX_ACCESS_TOKEN to be a GBDX oauth access_token (jwt).
-    Or, provide GBDX_USERNAME, GBDX_PASSWORD, GBDX_CLIENT_ID, and
-    GBDX_CLIENT_SECRET as environment variables.
+    There are two ways to create a GBDX session from environment variables:
+    1. Set GBDX_ACCESS_TOKEN and GBDX_REFRESH_TOKEN
+    2. Or, provide GBDX_USERNAME, GBDX_PASSWORD
     """
-    def save_token(token):
-        s.token = token
 
-    if os.environ.get('GBDX_ACCESS_TOKEN'):
-        s = OAuth2Session(client_id, client=LegacyApplicationClient(client_id, access_token=os.environ.get('GBDX_ACCESS_TOKEN')))
-    else:
-        environ = {var:os.environ[envvar] for var, envvar in environ_template}
-        s = OAuth2Session(client=LegacyApplicationClient(environ['client_id']),
-                          auto_refresh_url=auth_url,
-                          auto_refresh_kwargs={'client_id':environ['client_id'],
-                                               'client_secret':environ['client_secret']},
-                          token_updater=save_token)
+    if os.environ.get('GBDX_ACCESS_TOKEN', None) and os.environ.get('GBDX_REFRESH_TOKEN', None):
+        s = setup_gbdx_request_session(access_token=os.environ.get('GBDX_ACCESS_TOKEN'), refresh_token=os.environ.get('GBDX_REFRESH_TOKEN'))
 
-    s.fetch_token(auth_url, **environ)
+    elif os.environ.get('GBDX_USERNAME', None) and os.environ.get('GBDX_PASSWORD', None):
+        token = auth0_get_token_from_resource_owner_credentials(username=os.environ.get('GBDX_USERNAME'), password=os.environ.get('GBDX_PASSWORD'))
+        s = setup_gbdx_request_session(access_token=token['id_token'], refresh_token=token['refresh_token'])
+
     return s
 
 def session_from_kwargs(**kwargs):
-    def save_token(token):
-        s.token = token
-    auth_url='https://geobigdata.io/auth/v1/oauth/token/'
-    s = OAuth2Session(client=LegacyApplicationClient(kwargs.get('client_id')),
-                      auto_refresh_url=auth_url,
-                      auto_refresh_kwargs={'client_id':kwargs.get('client_id'),
-                                           'client_secret':kwargs.get('client_secret')},
-                      token_updater=save_token)
-
-    s.fetch_token(auth_url,
-                  username=kwargs.get('username'),
-                  password=kwargs.get('password'),
-                  client_id=kwargs.get('client_id'),
-                  client_secret=kwargs.get('client_secret'))
+    token = auth0_get_token_from_resource_owner_credentials(username=kwargs.get('username'), password=kwargs.get('password'))
+    s = setup_gbdx_request_session(access_token=token['id_token'], refresh_token=token['refresh_token'])
     return s
 
 
@@ -68,10 +102,22 @@ def session_from_config(config_file):
     """Returns a requests session object with oauth enabled for
     interacting with GBDX end points."""
 
-    def save_token(token_to_save):
+    def save_token(token):
         """Save off the token back to the config file."""
         if not 'gbdx_token' in set(cfg.sections()):
             cfg.add_section('gbdx_token')
+
+        # reformat token to match legacy gbdx token format
+        auth0_id_token = jwt.decode(token['id_token'], audience=GBDX_AUTH0_CLIENT_ID, options={"verify_signature":False})
+        token_to_save = {
+            "token_type": "Bearer",
+            "refresh_token": token['refresh_token'],
+            "access_token": token['id_token'],
+            "scope": ["read", "write"],
+            "expires_in": timegm(datetime.utcnow().utctimetuple()) - auth0_id_token['exp'],
+            "expires_at": auth0_id_token['exp']
+        }
+
         cfg.set('gbdx_token', 'json', json.dumps(token_to_save))
         with open(config_file, 'w') as sink:
             cfg.write(sink)
@@ -81,40 +127,22 @@ def session_from_config(config_file):
     if not cfg.read(config_file):
         raise RuntimeError('No ini file found at {} to parse.'.format(config_file))
 
-    client_id = cfg.get('gbdx', 'client_id')
-    client_secret = cfg.get('gbdx', 'client_secret')
-
     # See if we have a token stored in the config, and if not, get one.
     if 'gbdx_token' in set(cfg.sections()):
         # Parse the token from the config.
         token = json.loads(cfg.get('gbdx_token','json'))
 
-        # Update the token experation with a little buffer room.
+        # Update the token experation   with a little buffer room.
         token['expires_in'] = (datetime.utcfromtimestamp(token['expires_at']) -
                                datetime.utcnow()).total_seconds() - 600
 
-        # Note that to use a token from the config, we have to set it
-        # on the client and the session!
-        s = OAuth2Session(client_id, client=LegacyApplicationClient(client_id, token=token),
-                          auto_refresh_url=cfg.get('gbdx','auth_url'),
-                          auto_refresh_kwargs={'client_id':client_id,
-                                               'client_secret':client_secret},
-                          token_updater=save_token)
-        s.token = token
+        s = setup_gbdx_request_session(access_token=token['access_token'], refresh_token=token['refresh_token'])
+
     else:
         # No pre-existing token, so we request one from the API.
-        s = OAuth2Session(client_id, client=LegacyApplicationClient(client_id),
-                          auto_refresh_url=cfg.get('gbdx','auth_url'),
-                          auto_refresh_kwargs={'client_id':client_id,
-                                               'client_secret':client_secret},
-                          token_updater=save_token)
+        token = auth0_get_token_from_resource_owner_credentials(username=cfg.get('gbdx','user_name'), password=cfg.get('gbdx','user_password'))
+        s = setup_gbdx_request_session(access_token=token['access_token'], refresh_token=token['refresh_token'])
 
-        # Get the token and save it to the config.
-        token = s.fetch_token(cfg.get('gbdx','auth_url'),
-                              username=cfg.get('gbdx','user_name'),
-                              password=cfg.get('gbdx','user_password'),
-                              client_id=client_id,
-                              client_secret=client_secret)
         save_token(token)
 
     return s
@@ -146,6 +174,7 @@ user_password = your_password"""
     if not os.path.isfile(config_file):
         raise Exception("Please create a GBDX credential file at ~/.gbdx-config with these contents:\n%s" % error_output)
 
+    session = session_from_config(config_file)
     try:
       session = session_from_config(config_file)
     except:
