@@ -15,6 +15,7 @@ import requests
 import jwt
 from calendar import timegm
 from datetime import datetime
+from functools import partial
 
 # default to GBDX production auth0 client ID
 GBDX_AUTH0_CLIENT_ID = os.environ.get('GBDX_AUTH0_CLIENT_ID', "vhaNEJymL4m1UCo4TqXmuKtkn9JCYDkT")
@@ -26,7 +27,20 @@ if not GBDX_AUTH0_CLIENT_ID:
 if not GBDX_AUTH0_DOMAIN:
     raise Exception("GBDX_AUTH0_DOMAIN must be defined. Value provided was '{}'".format(GBDX_AUTH0_DOMAIN) )
 
+
 def setup_gbdx_request_session(access_token, refresh_token):
+
+    def auto_refresh_expired_token(r, *args, **kwargs):
+        # token might be expired, refresh token and try request again
+        if r.status_code == 401:
+            print "expire"
+            new_token = auth0_get_token_from_refresh_token(refresh_token)
+            new_token['refresh_token'] = refresh_token
+            headers = {"Authorization":"Bearer {}".format(new_token['id_token'])}
+            s.headers.update(headers)
+            r.request.headers.update(headers)
+
+            return s.send(r.request)
 
     if not access_token:
         raise Exception("access_token is a required parameter. Value provided was '{}'".format(access_token) )
@@ -37,6 +51,7 @@ def setup_gbdx_request_session(access_token, refresh_token):
     s = requests.Session()
     headers = {"Authorization":"Bearer {}".format(access_token)}
     s.headers.update(headers)
+    s.hooks=dict(response=auto_refresh_expired_token)
 
     return s
 
@@ -57,19 +72,6 @@ def auth0_get_token_from_refresh_token(refresh_token=None):
 
     d = auth0.Delegated(domain=GBDX_AUTH0_DOMAIN)
     return d.get_token(client_id=GBDX_AUTH0_CLIENT_ID, target=GBDX_AUTH0_CLIENT_ID, grant_type='urn:ietf:params:oauth:grant-type:jwt-bearer', refresh_token=refresh_token, scope='openid offline_access', api_type='app')
-
-def auth0_is_access_token_expired(access_token):
-    try:
-        #
-        # Check if the token is expired and try to refresh it.
-        # NOTE signature is not validated here. We do not have access to the client_secret and
-        #   are only concerned about expired tokens. Server side apis will validate the signature.
-        #
-        jwt.decode(access_token, audience=GBDX_AUTH0_CLIENT_ID, options={"verify_signature":False})
-    except jwt.ExpiredSignatureError:
-        # automatically refresh any tokens that expire in the future
-        token = auth0_get_token_from_refresh_token(refresh_token)
-        access_token = token['id_token']
 
 
 def session_from_envvars(auth_url='https://geobigdata.io/auth/v1/oauth/token/',
@@ -97,30 +99,31 @@ def session_from_kwargs(**kwargs):
     s = setup_gbdx_request_session(access_token=token['id_token'], refresh_token=token['refresh_token'])
     return s
 
+def save_token_to_config_file(cfg, config_file, token):
+    """Save off the token back to the config file."""
+    if not 'gbdx_token' in set(cfg.sections()):
+        cfg.add_section('gbdx_token')
+
+    # reformat token to match legacy gbdx token format
+    auth0_id_token = jwt.decode(token['id_token'], audience=GBDX_AUTH0_CLIENT_ID, options={"verify_signature":False})
+    token_to_save = {
+        "token_type": "Bearer",
+        "refresh_token": token['refresh_token'],
+        "access_token": token['id_token'],
+        "scope": ["read", "write"],
+        "expires_in": timegm(datetime.utcnow().utctimetuple()) - auth0_id_token['exp'],
+        "expires_at": auth0_id_token['exp']
+    }
+
+    cfg.set('gbdx_token', 'json', json.dumps(token_to_save))
+    print dir(cfg)
+    with open(config_file, 'w') as sink:
+        cfg.write(sink)
+
 
 def session_from_config(config_file):
     """Returns a requests session object with oauth enabled for
     interacting with GBDX end points."""
-
-    def save_token(token):
-        """Save off the token back to the config file."""
-        if not 'gbdx_token' in set(cfg.sections()):
-            cfg.add_section('gbdx_token')
-
-        # reformat token to match legacy gbdx token format
-        auth0_id_token = jwt.decode(token['id_token'], audience=GBDX_AUTH0_CLIENT_ID, options={"verify_signature":False})
-        token_to_save = {
-            "token_type": "Bearer",
-            "refresh_token": token['refresh_token'],
-            "access_token": token['id_token'],
-            "scope": ["read", "write"],
-            "expires_in": timegm(datetime.utcnow().utctimetuple()) - auth0_id_token['exp'],
-            "expires_at": auth0_id_token['exp']
-        }
-
-        cfg.set('gbdx_token', 'json', json.dumps(token_to_save))
-        with open(config_file, 'w') as sink:
-            cfg.write(sink)
 
     # Read the config file (ini format).
     cfg = ConfigParser()
@@ -136,14 +139,13 @@ def session_from_config(config_file):
         token['expires_in'] = (datetime.utcfromtimestamp(token['expires_at']) -
                                datetime.utcnow()).total_seconds() - 600
 
-        s = setup_gbdx_request_session(access_token=token['access_token'], refresh_token=token['refresh_token'])
-
     else:
         # No pre-existing token, so we request one from the API.
         token = auth0_get_token_from_resource_owner_credentials(username=cfg.get('gbdx','user_name'), password=cfg.get('gbdx','user_password'))
-        s = setup_gbdx_request_session(access_token=token['access_token'], refresh_token=token['refresh_token'])
 
-        save_token(token)
+        save_token_to_config_file(cfg, config_file, token)
+
+    s = setup_gbdx_request_session(access_token=token['access_token'], refresh_token=token['refresh_token'])
 
     return s
 
