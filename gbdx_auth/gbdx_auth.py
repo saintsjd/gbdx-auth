@@ -33,13 +33,15 @@ def setup_gbdx_request_session(access_token, refresh_token):
     def auto_refresh_expired_token(r, *args, **kwargs):
         # token might be expired, refresh token and try request again
         if r.status_code == 401:
-            print "expire"
             new_token = auth0_get_token_from_refresh_token(refresh_token)
             new_token['refresh_token'] = refresh_token
             headers = {"Authorization":"Bearer {}".format(new_token['id_token'])}
             s.headers.update(headers)
             r.request.headers.update(headers)
-
+            # update environment vars 
+            os.environ['GBDX_ACCESS_TOKEN'] = new_token['id_token']
+            os.environ['GBDX_REFRESH_TOKEN'] = new_token['refresh_token']
+    
             return s.send(r.request)
 
     if not access_token:
@@ -116,7 +118,6 @@ def save_token_to_config_file(cfg, config_file, token):
     }
 
     cfg.set('gbdx_token', 'json', json.dumps(token_to_save))
-    print dir(cfg)
     with open(config_file, 'w') as sink:
         cfg.write(sink)
 
